@@ -52,6 +52,17 @@ covers Phase 3 (agent design and implementation).
     - [15.4 Booting and stopping the agent](#154-booting-and-stopping-the-agent)
     - [15.5 Peeking at database schemas](#155-peeking-at-database-schemas)
     - [15.6 Available databases](#156-available-databases)
+16. [Phase 4 — Langfuse wiring](#16-phase-4--langfuse-wiring)
+    - [16.1 Provisioning Langfuse via init env vars (no UI clicks)](#161-provisioning-langfuse-via-init-env-vars-no-ui-clicks)
+    - [16.2 Langfuse "tags" vs "metadata"](#162-langfuse-tags-vs-metadata)
+    - [16.3 What the trace structure tells you at a glance](#163-what-the-trace-structure-tells-you-at-a-glance)
+    - [16.4 Metadata tagging strategy for Phase 6](#164-metadata-tagging-strategy-for-phase-6)
+17. [Phase 5 — Eval runner](#17-phase-5--eval-runner)
+    - [17.1 What `eval_one` returns and why](#171-what-eval_one-returns-and-why)
+    - [17.2 Per-iteration carry-forward — the load-bearing rule](#172-per-iteration-carry-forward--the-load-bearing-rule)
+    - [17.3 Scorable vs total — denominator hygiene](#173-scorable-vs-total--denominator-hygiene)
+    - [17.4 The diagnostic that actually matters](#174-the-diagnostic-that-actually-matters)
+    - [17.5 Smoke-test findings](#175-smoke-test-findings)
 
 ---
 
@@ -882,6 +893,13 @@ Modest bump above the 0.9 default. Defensible because:
 37. **Smoke-test against a cheap endpoint before burning expensive GPU time.** A 5-question test on OpenAI gpt-4o-mini at ~$0.01/question can catch agent bugs and prompt failures for under $0.05 total. Catching them on an H100 wastes GPU minutes.
 38. **Read traces, not just outputs.** The `history` field tells you *why* the final answer is what it is. `ok=True` with empty rows is a different bug than `ok=False` with an error — only the history distinguishes them.
 39. **"Code is correct" and "prompts are good" are separate test dimensions.** Round 4-style smoke tests validate the first. Phase 5/6-style evals validate the second. Don't conflate "agent runs end-to-end" with "agent answers correctly."
+40. **For dev-platform init env vars, set the IDs even if they look optional.** Langfuse's `LANGFUSE_INIT_ORG_ID` and `LANGFUSE_INIT_PROJECT_ID` are listed as optional but silently disable all other init vars if absent. Read the source if you're getting "nothing seems to happen" behavior from supposedly-optional config.
+41. **One-shot init flows are irreversible without volume wipe.** When a tool says "this happens on first boot," any subsequent change to the init config requires destroying the underlying state. Plan for this.
+42. **Span counts in trace lists are a free diagnostic.** Distribution shifts in span count across batches reveal behavioral changes without opening individual traces.
+43. **Distinguish "unscorable" from "incorrect."** In eval output, `None` for "skip in denominator" and `False` for "counted as wrong" are different signals with different remedies. Conflating them silently inflates or deflates pass rates.
+44. **Counterfactual metrics need an explicit definition** for the questions that don't reach the cutoff. "Pass rate at iter k with carry-forward" is meaningful; "pass rate at iter k" alone is ambiguous.
+45. **Same denominator at every measurement point.** When comparing iter-1 vs iter-3 pass rates (or any counterfactual cutoffs), use the same population. Otherwise the comparison measures different things and the trend is noise.
+46. **Surface infrastructure failures separately from model failures.** `agent_errors` (HTTP/timeout) and `gold_errors` (broken eval data) need their own counts — they're not just "things that didn't pass." Hiding them in an aggregate denominator misattributes the cause.
 
 ---
 
@@ -1468,13 +1486,13 @@ Three real, defensible findings worth recording for the Phase 6 iteration log:
 
 2. **Verifier is too lenient on zero-row results from common-data questions.** Q4 returned 0 rows for *"male clients in Prague"* and verify approved. The Round 1 taxonomy includes this case ("zero rows when rows expected") but the prompt's zero-rows caveat *("zero rows is sometimes the correct answer")* is over-applied. The model defaults to giving SQL benefit of the doubt.
 
-3. **Cryptic-column databases need extra context.** Q5 needed BIRD's "evidence" hint (which maps `A15` → "crimes in 1995") to be solvable. The current `AgentState` and prompts don't surface the hint field. This is a known limitation worth flagging in Phase 7's "what I'd do with more time."
+3. **Cryptic-column databases hit a quality ceiling (expected, not a defect).** Q5 needed BIRD's "evidence" hint (which maps `A15` → "crimes in 1995") to be solvable. The current `AgentState` and prompts don't surface the hint field — **and per task-author guidance (Gleb Berjoskin, course chat, 8 Jun 2026), the assignment is meant to be solved WITHOUT evidence hints.** So this is an accepted ceiling, not a bug to fix. Another participant reported ~33% pass rate without evidence vs ~53% with, on the same Qwen model — so the gap is real and expected. Do not extend `AgentState` to carry a hint field; that would deviate from assignment intent.
 
 #### Tuning hypotheses for Phase 6
 
 - **For finding 1:** rebalance the verifier's third failure mode. *"Wrong columns"* should be reframed as "*returned columns can't possibly answer the question*," not "*didn't return everything I'd want to see*."
 - **For finding 2:** soften the zero-rows caveat. Currently: *"Zero rows is sometimes the correct answer ... use judgment."* Tighter version: *"Reject 0-row results unless the question explicitly suggests data may be absent."*
-- **For finding 3:** extend `AnswerRequest` and `AgentState` to carry a `hint: str | None` field, and inject it into the generate/revise prompts when present. Future scope only.
+- **For finding 3:** *no tuning.* The constraint is intentional per task-author guidance. Mention it in REPORT.md as an accepted ceiling that quantifies how much of the eval failure is structural vs. fixable. Phase 5 baseline pass-rate around 33% is the realistic target.
 
 These are exactly the kind of hypotheses Phase 6's "*saw X → hypothesized Y → changed Z → result W*" loop is meant to test. Run the baseline Phase 5 eval first to quantify the current verifier's pass rate, then change one verify-prompt clause at a time and measure.
 
@@ -1656,3 +1674,245 @@ Pre-baked questions live in:
 
 - `evals/eval_set.jsonl` — 30 curated questions *with* gold SQL (use these to check correctness)
 - `load_test/perf_pool.jsonl` — 1500 questions for load testing, no gold SQL but more variety
+
+---
+
+## 16. Phase 4 — Langfuse wiring
+
+The scaffolding already wires the Langfuse callback at `agent/server.py:27` — it activates if `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set in `.env`. The work in Phase 4 is operational: boot the docker stack, provision keys, fire traces, verify they land.
+
+### 16.1 Provisioning Langfuse via init env vars (no UI clicks)
+
+The README's suggested path is "sign up via the web UI, create a project, copy the keys, paste them into `.env`." That works but it's clicky. The cleaner path is **Langfuse's `LANGFUSE_INIT_*` environment variables**, which provision everything on first boot.
+
+#### The full set of init vars
+
+Set these on the `langfuse-web` container in `docker-compose.yml`:
+
+```yaml
+LANGFUSE_INIT_ORG_ID: course-org           # REQUIRED — see gotcha below
+LANGFUSE_INIT_ORG_NAME: Course
+LANGFUSE_INIT_PROJECT_ID: default-project  # REQUIRED — see gotcha below
+LANGFUSE_INIT_PROJECT_NAME: Default
+LANGFUSE_INIT_USER_EMAIL: dev@local.dev    # must pass email format validation
+LANGFUSE_INIT_USER_NAME: dev
+LANGFUSE_INIT_USER_PASSWORD: course-local-not-for-prod
+LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-<uuid>
+LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-<uuid>
+```
+
+You then put the same `pk-lf-...` / `sk-lf-...` values into `.env` as `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`. Boot the stack and you can log into the UI immediately with the email/password above, or hit the API directly with the key pair. **No setup clicks needed.**
+
+#### The gotchas I hit (in the order they bit me)
+
+1. **`LANGFUSE_INIT_ORG_ID` and `LANGFUSE_INIT_PROJECT_ID` are REQUIRED** even though the docs list them as optional. If they're absent, *all other* `LANGFUSE_INIT_*` vars are silently ignored — the only signal is a warning in `langfuse-web` logs:
+   > `LANGFUSE_INIT_ORG_ID is not set but other LANGFUSE_INIT_* variables are configured. The following variables will be ignored: ...`
+   No error, no boot failure — it just doesn't provision anything. *Always set both IDs.*
+
+2. **Email validator is strict.** `dev@local` is rejected with `Invalid environment variables: { LANGFUSE_INIT_USER_EMAIL: [ 'Invalid input' ] }`. Needs a proper TLD format like `dev@local.dev`. The container fails to start until you fix this.
+
+3. **Init only runs on a clean postgres volume.** If you've ever booted langfuse-web against this postgres before (even a partial/failed boot), the init block won't run again. Re-provisioning requires:
+   ```bash
+   docker compose down
+   docker volume rm mlops-assignment_postgres-data \
+                     mlops-assignment_clickhouse-data \
+                     mlops-assignment_clickhouse-logs \
+                     mlops-assignment_minio-data
+   docker compose up -d
+   ```
+   The clickhouse and minio volumes aren't strictly required for re-init, but wiping them avoids residual state from old projects.
+
+4. **Port conflicts with other dev stacks.** If you have an old assignment's compose stack still up (e.g., `mlops-hw-2-prometheus-1`), it'll hold ports 9090 / 3000 / etc. `docker stop <container-name>` stops without deleting volumes — you can restart later.
+
+### 16.2 Langfuse "tags" vs "metadata"
+
+The two concepts look similar in the UI but they're distinct:
+
+| | Langfuse tags | Langfuse metadata |
+|---|---|---|
+| Shape | array of strings (`["baseline", "iter1"]`) | key-value object (`{"experiment": "iter1"}`) |
+| Where they show in UI | "Tags" filter, "Tags" column | "Metadata" filter, "Metadata" column |
+| What our agent emits | nothing (currently) | what you pass as HTTP `tags` field |
+
+The agent's `AnswerRequest.tags` is a `dict[str, str]` and gets passed through to Langfuse as `metadata=` in the LangChain callback config (`agent/server.py:60`). So when you call:
+
+```bash
+curl -X POST .../answer -d '{"question": "...", "db": "superhero", "tags": {"experiment": "phase4-batch-1"}}'
+```
+
+…the trace lands in Langfuse with `metadata.experiment = "phase4-batch-1"`, queryable via the **Metadata** filter, not the Tags filter. The README calls this "metadata tags" — confusing terminology, but it's the metadata-object variant they mean.
+
+If we wanted Langfuse's first-class `tags` (string array) instead, we'd add `"tags": [...]` alongside `"metadata": {...}` in the callback config. The current setup uses metadata, which is enough for everything Phase 6 needs.
+
+### 16.3 What the trace structure tells you at a glance
+
+After firing 10 questions, the trace list shows a span count per trace. The counts encode the agent's behavior:
+
+| Span count | What happened |
+|---|---|
+| 8 | First-try pass (generate → verify said ok) |
+| 14 | One revise loop (generate → verify reject → revise → verify ok) |
+| 20 | Hit MAX_ITERATIONS (generate → verify → revise → verify → revise → verify → forced exit) |
+
+You can read the per-iteration pass-rate visually from the trace-list view, without opening individual traces. In the 10-question batch from this Phase 4 setup, we saw 6×8, 1×14, 3×20 spans — matching the iteration counts the HTTP responses reported (6 first-try, 1 one-revise, 3 maxed-out).
+
+**Useful pattern:** if you see a sudden shift in the distribution (e.g., suddenly more 20-span traces), that's a signal verify is rejecting more, which is itself a hint that something about the model or prompt has shifted.
+
+#### Traces land even on failure
+
+When the OpenAI key was 401'd, the agent returned HTTP 500 — but the LangGraph trace still landed in Langfuse, marked with the error. This is genuinely useful: you can debug failed requests in the same UI as successful ones, no need to scrape application logs separately.
+
+### 16.4 Metadata tagging strategy for Phase 6
+
+The agent already supports arbitrary metadata through `AnswerRequest.tags`. For Phase 6's load-test → diagnose → tune → re-test loop, four tags are worth standardizing on:
+
+| Tag | Example values | Why |
+|---|---|---|
+| `experiment` | `"baseline"`, `"iter1"`, `"iter2"` | Lets you filter all traces from one tuning iteration |
+| `vllm_config` | `"fp8-2048batch"`, `"fp8-4096batch"` | Short label of the serving config — pairs with `experiment` for cross-reference |
+| `db_id` | `"superhero"`, `"financial"` | Already passing — spots DB-specific patterns (e.g., financial fails more often → cryptic-column ceiling) |
+| `iteration_id` | timestamp or short UUID | Disambiguates two runs with the same config (e.g., re-running baseline) |
+
+#### What needs changing for Phase 6
+
+Currently neither `load_test/driver.py` nor `evals/run_eval.py` passes tags. Both would benefit from a small extension:
+
+- `load_test/driver.py`: in `fire_one` (~line 36), expand the payload to include `"tags": {...}` from CLI args (e.g., `--tag experiment=iter1`).
+- `evals/run_eval.py`: in `eval_one` (Phase 5 work), pass `"tags": {"experiment": "eval-baseline", "db_id": q["db_id"]}`.
+
+Both changes are 2–3 lines each. We'll make them when we tackle Phase 5/6 properly.
+
+#### Habits added this round
+
+- **Always set both `LANGFUSE_INIT_ORG_ID` and `LANGFUSE_INIT_PROJECT_ID`** when using init vars — without them everything else is silently ignored.
+- **Init env vars only honoured on a clean state**. Treat first-boot configuration as "best effort, irreversible without volume wipe."
+- **Distinguish concepts that share words.** "Tags" and "metadata" are different objects in Langfuse despite sounding interchangeable. Same applies to many platforms — always check the API shape before assuming words mean what they imply.
+- **Use span counts as a free diagnostic signal.** Listing traces by span count reveals behavior distribution without inspecting individual traces.
+
+---
+
+## 17. Phase 5 — Eval runner
+
+The scaffolding provides `run_sql`, `canonicalize`, and `matches` helpers. The two functions to implement are `eval_one` and `summarize` in `evals/run_eval.py`. The interesting design decisions are about *what to count* and *how to tell whether the verify→revise loop earns its keep*.
+
+### 17.1 What `eval_one` returns and why
+
+Per-question dict shape (one entry per question in the eval set):
+
+```python
+{
+    "question": str,                       # the eval inputs
+    "db_id": str,
+    "gold_sql": str,
+    "agent_ok": bool,                      # did the HTTP call succeed?
+    "agent_error": str | None,
+    "gold_ok": bool,                       # does the gold SQL even run?
+    "gold_error": str | None,
+    "iterations_used": int,                # how many SQL attempts the agent made
+    "final_sql": str,
+    "final_correct": bool | None,          # None ⇒ unscorable
+    "per_iteration": [                     # one entry per agent attempt
+        {"iteration": 1, "sql": "...", "correct": bool, "exec_ok": bool, "error": str | None},
+        ...
+    ],
+    "wall_clock_seconds": float,
+}
+```
+
+#### Why each field is there
+
+- **`agent_ok` / `agent_error`** vs **`gold_ok` / `gold_error`**: two distinct failure modes that have different meanings for the metric. Agent-side failures are *infrastructure issues* (LLM endpoint down, timeout) — not the model's fault. Gold-side failures mean the eval set itself is broken on this question. Both make the question unscorable, but for different reasons that we surface separately.
+- **`final_correct: bool | None`**: `None` specifically signals "unscorable — do not include in pass-rate denominator." This is different from `False` which means "we ran it and it was wrong." Conflating them would silently inflate or deflate pass rates.
+- **`per_iteration` is a list of dicts, not just booleans**: storing the SQL string at each iteration plus its exec status lets you later diff what the model changed between attempts (useful for Phase 6 trace forensics).
+- **Tags `{"experiment": "eval-baseline", "db_id": db_id}` are passed through to the agent's HTTP body**, which flows into Langfuse metadata. Future Phase 6 work can then filter Langfuse traces by `experiment=eval-baseline` vs `experiment=load-test-iter2` etc.
+
+#### Per-iteration SQL extraction
+
+The agent's response history contains entries from every node — `generate_sql`, `execute`, `verify`, `revise`. SQL strings appear on `generate_sql` and `revise` entries in iteration order. So:
+
+```python
+per_iter_sqls = [h.get("sql", "") for h in history if h.get("node") in ("generate_sql", "revise")]
+```
+
+…gives the list of SQL attempts, indexed by iteration number (1-based: `per_iter_sqls[0]` is iter 1). This avoids having to thread the iteration count through the agent's history shape.
+
+### 17.2 Per-iteration carry-forward — the load-bearing rule
+
+The README's docstring states:
+
+> *Per-iteration carry-forward: if the agent terminated at iteration j < k, treat the question's iteration-k result as identical to its iteration-j result.*
+
+#### Why this matters
+
+The whole point of the per-iteration pass rate is to answer: *"What would my pass rate have been if I'd cut off the agent after k iterations?"* — a counterfactual.
+
+If a question passes at iter 1 and the agent stops there, what would have been served at iter 2? *Still iter 1's answer* — the agent had nothing else to emit. So iter 2's contribution for that question = iter 1's correctness.
+
+Without carry-forward, you'd undercount: questions that terminated early would silently drop out of the iter-2 denominator (or the iter-2 result would be undefined). Either way, the comparison "iter 1 vs iter 3" becomes meaningless because it's measured on different populations.
+
+#### How it's implemented
+
+In `summarize`, for each scorable question, walk `k = 1..MAX_ITERATIONS`:
+
+```python
+last_correct = False
+for k in range(1, MAX_ITERATIONS + 1):
+    if k <= len(attempts):
+        last_correct = attempts[k - 1]["correct"]    # fresh attempt at this iter
+    # else: last_correct stays at whatever attempts[-1] gave (carry-forward)
+    if last_correct:
+        per_iter_correct[k] += 1
+```
+
+Result: the denominator at every iteration k is the same set of scorable questions, so iter-1 and iter-3 are directly comparable.
+
+### 17.3 Scorable vs total — denominator hygiene
+
+`summarize` separates three counts:
+
+- **`n_questions`**: total in the eval set.
+- **`agent_errors`**: HTTP failures (LLM endpoint down, timeout, etc.) — agent didn't get to try.
+- **`gold_errors`**: gold SQL itself broken — eval set defect, agent can't be blamed.
+- **`n_scorable`**: `n_questions − agent_errors − gold_errors` — the actual pass-rate denominator.
+
+Reporting `overall_pass_rate = n_correct / n_scorable` (not `/ n_questions`) means:
+
+- A misconfigured LLM endpoint that fails 5 out of 30 questions doesn't artificially crater the pass-rate.
+- A bug in the eval set's gold SQL doesn't penalize the model.
+- The number you report is what *the model* contributed, separated from infrastructure noise.
+
+Both error counts are surfaced in the summary so a reader can see *why* `n_scorable < n_questions`. Hiding them would let bad denominators look fine.
+
+### 17.4 The diagnostic that actually matters
+
+From the README (line 332):
+
+> *"If iter 0 pass rate is the same as iter 3 pass rate, your agent architecture is doing nothing. If iter 3 is meaningfully higher, the loop is earning its keep."*
+
+The four patterns to watch for:
+
+| Pattern | What it means |
+|---|---|
+| iter 1 == iter 3 == iter N | Verify never rejects, or verify rejects but revise never fixes. **Loop is dead weight.** |
+| iter 3 > iter 1 | Loop adds genuine value — revise actually corrects errors. **Architecture earns its keep.** |
+| iter 3 < iter 1 | Loop is *destroying* quality — revise turns right answers wrong. **Verify is over-eager** (Round 4's Q3 finding). |
+| iter 1 high, iter 3 same | Verify rarely fires. Could be good (most questions just work) or bad (verifier too lenient). Check iteration distribution to tell which. |
+
+The per-iteration pass rate alone doesn't distinguish "loop helps some, hurts others equally" from "loop does nothing." For that, you need to look at *per-question deltas*: how often did iter-2 flip from True→False vs False→True? A high churn rate with a flat headline pass-rate is the clearest signal that the loop is *noisy*. The `per_iteration` data we store supports computing this in a follow-up analysis script if needed.
+
+### 17.5 Smoke-test findings
+
+3-question smoke test against OpenAI gpt-4o-mini confirmed:
+
+- Pipeline works end-to-end (HTTP call → per-iter scoring → summarize → JSON write).
+- Carry-forward fires correctly: Q3 hit iter 2 (revise didn't help), its iter-3 result inherits iter-2's `False`; the pass rate stays at 2/3 across all three iterations.
+- `eval-baseline` tags land in Langfuse — confirmed visible in the Metadata column.
+
+These predict (but don't quantify) Tuesday's real numbers against Qwen. The headline figure to aim for is ~33% per the task author's reference (without evidence hints). The interesting comparison will be iter-1 vs iter-3.
+
+#### Habits added this round
+
+- **Distinguish "unscorable" from "incorrect"** in eval-runner output. They're different signals and have different remedies. Use `None` to mean "skip in denominator," `False` to mean "counted as wrong."
+- **Same denominator at every iteration** for per-iteration comparison. Without carry-forward, iter-1 and iter-3 measure different populations and the comparison becomes meaningless.
+- **Surface infrastructure errors separately from model errors.** `agent_errors` and `gold_errors` shouldn't be hidden inside an aggregated `n_failed` — the reader needs to see why the denominator shrank.
+- **Counterfactual metrics need explicit definition.** "Pass rate at iter k" only makes sense once you specify what happens to questions that terminated before k. Write the rule down in the docstring; don't leave it implicit.

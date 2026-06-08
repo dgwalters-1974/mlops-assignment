@@ -159,8 +159,18 @@ services:
       <<: *langfuse-env
       NEXTAUTH_URL: http://localhost:3001
       NEXTAUTH_SECRET: course-nextauth-not-for-prod
+      # First-boot provisioning — lets us skip the web signup flow.
+      # Only honoured on a clean postgres volume; wipe `postgres-data` to re-seed.
+      # ORG_ID and PROJECT_ID are REQUIRED for any INIT_* vars to take effect.
+      LANGFUSE_INIT_ORG_ID: course-org
       LANGFUSE_INIT_ORG_NAME: Course
+      LANGFUSE_INIT_PROJECT_ID: default-project
       LANGFUSE_INIT_PROJECT_NAME: Default
+      LANGFUSE_INIT_USER_EMAIL: dev@local.dev
+      LANGFUSE_INIT_USER_NAME: dev
+      LANGFUSE_INIT_USER_PASSWORD: course-local-not-for-prod
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-671b9a98-d47d-495c-87c1-abf073e6c730
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-e5374392-8c14-43a2-8d4a-528f29d9edb2
 
 volumes:
   prometheus-data:

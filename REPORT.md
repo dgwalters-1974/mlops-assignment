@@ -35,3 +35,7 @@ See `scripts/start_vllm.sh` for the launch command. Eight non-default flags:
 ## What Phase 6 will likely revise
 
 Starting config derived from SLO sketch, not observed load. Most likely to iterate: `--max-num-batched-tokens` (prefill/decode balance is the most workload-sensitive lever), `--gpu-memory-utilization` (push higher if no OOM and KV pressure remains binding), `--max-num-seqs` (raise if scheduler cap binds before KV).
+
+## A note on BIRD's evidence field
+
+Per task-author guidance in the course chat (Gleb Berjoskin, 8 Jun 2026), the BIRD `evidence` hints are intentionally not surfaced into the agent's prompts. The scaffolding's `scripts/load_data.py` drops the field; we preserve that behaviour. This caps achievable execution accuracy on databases with cryptic column names (e.g., `financial.A##` codes), since the model cannot learn from prompt context that `A15` means "crimes in 1995." Phase 5 baseline numbers should be read against this constraint; another participant reported ~33% without evidence vs ~53% with on the same model, so the gap is real and expected.
