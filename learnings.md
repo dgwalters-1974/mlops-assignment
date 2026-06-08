@@ -36,6 +36,22 @@ covers Phase 3 (agent design and implementation).
     - [12.2 Verify prompts](#122-verify-prompts)
     - [12.3 Revise prompts and the shared-system-prompt trick](#123-revise-prompts-and-the-shared-system-prompt-trick)
     - [12.4 Round 2 cross-cutting principles](#124-round-2-cross-cutting-principles)
+13. [Phase 3 — Node implementation (Round 3)](#13-phase-3--node-implementation-round-3)
+    - [13.1 `route_after_verify` — the trivial router](#131-route_after_verify--the-trivial-router)
+    - [13.2 `revise_node` — mirror of generate, different prompt](#132-revise_node--mirror-of-generate-different-prompt)
+    - [13.3 `verify_node` and defensive JSON parsing](#133-verify_node-and-defensive-json-parsing)
+    - [13.4 Patterns to remember](#134-patterns-to-remember)
+14. [Phase 3 — Interactive smoke test against OpenAI (Round 4)](#14-phase-3--interactive-smoke-test-against-openai-round-4)
+    - [14.1 Five-question test results](#141-five-question-test-results)
+    - [14.2 Findings for Phase 6](#142-findings-for-phase-6)
+    - [14.3 What the smoke test validated](#143-what-the-smoke-test-validated)
+15. [Manual testing the agent — practical reference](#15-manual-testing-the-agent--practical-reference)
+    - [15.1 The `ask()` shell helper](#151-the-ask-shell-helper)
+    - [15.2 Shell quoting gotchas](#152-shell-quoting-gotchas)
+    - [15.3 Useful jq filters](#153-useful-jq-filters)
+    - [15.4 Booting and stopping the agent](#154-booting-and-stopping-the-agent)
+    - [15.5 Peeking at database schemas](#155-peeking-at-database-schemas)
+    - [15.6 Available databases](#156-available-databases)
 
 ---
 
@@ -857,6 +873,15 @@ Modest bump above the 0.9 default. Defensible because:
 28. **For structured outputs, show literal examples in the prompt.** Models copy what they see more reliably than they follow descriptions of schemas. Two examples (one for each output case) beat a prose schema description.
 29. **Across-step prefix caching requires identical system prompts.** Put step-specific framing in the user message, not the system message. `REVISE_SYSTEM = GENERATE_SQL_SYSTEM` is a deliberate sharing pattern, not laziness.
 30. **Always pair "prompt asks for X" with "code defensively parses non-X."** The prompt is a request; the parser is the safety net. Capable models follow format contracts most of the time, not all of the time.
+31. **Guard upstream-state assumptions explicitly.** When a node depends on a state field populated by an upstream node (`state.execution` here), guard against `None` with a self-describing fallback. The graph *should* never reach the node with that field unset, but the cost of a 2-line guard is much lower than the cost of a `NoneType` AttributeError under a future code path.
+32. **On parse failure, default to the safe outcome — not the convenient one.** If you can't parse the verifier's verdict, default to "not ok" (do an extra revise) rather than "ok" (ship an unverified answer). Unread failures are better than silent wrong answers.
+33. **Mirror worked examples aggressively.** When scaffolding gives you a template (here: `generate_sql_node`), the implementation that mirrors it should be ~95% copy-paste. Save original thinking for the novel parts.
+34. **Co-locate defensive parsers with the prompts they defend.** Put `_extract_sql` next to where SQL prompts are used, `_parse_verify_json` next to where JSON prompts are used. Adjacency makes the "always parse at LLM boundaries" pattern visible.
+35. **Three layers of robustness > one strong layer.** For LLM output: (1) format contract in the prompt, (2) defensive parser at the boundary, (3) `.get(key, default)` calls in the consumer. Each layer cheap; together they handle real noise.
+36. **Partial state returns are self-documenting.** A node's return dict shows exactly what it changes. The diff is the documentation; full-state returns hide the mutation in noise.
+37. **Smoke-test against a cheap endpoint before burning expensive GPU time.** A 5-question test on OpenAI gpt-4o-mini at ~$0.01/question can catch agent bugs and prompt failures for under $0.05 total. Catching them on an H100 wastes GPU minutes.
+38. **Read traces, not just outputs.** The `history` field tells you *why* the final answer is what it is. `ok=True` with empty rows is a different bug than `ok=False` with an error — only the history distinguishes them.
+39. **"Code is correct" and "prompts are good" are separate test dimensions.** Round 4-style smoke tests validate the first. Phase 5/6-style evals validate the second. Don't conflate "agent runs end-to-end" with "agent answers correctly."
 
 ---
 
@@ -1227,3 +1252,407 @@ This makes the first ~1900 tokens cacheable across all three calls within one ag
 - **Never trust the model's surface format.** Parse defensively — extract SQL from fences in `generate_sql`/`revise`, parse JSON forgivingly in `verify`.
 - **For loops with an iteration cap, the termination check must be unconditional.** Even if the "natural" exit condition (verify_ok) is never satisfied, the cap forces termination. Without it, the graph can deadlock.
 - **Prompt content selection is also tokens-budget management.** Excluding a field isn't censorship — it's reducing noise, preserving cacheable prefix, and focusing the model's attention on signal.
+
+---
+
+## 13. Phase 3 — Node implementation (Round 3)
+
+The actual code for the three remaining stubs in `agent/graph.py`. After Rounds 1 and 2 every design decision was already made, so Round 3 was mostly mechanical transcription. The patterns are worth recording.
+
+### 13.1 `route_after_verify` — the trivial router
+
+Three lines, derived directly from §11.3:
+
+```python
+def route_after_verify(state: AgentState) -> str:
+    if state.verify_ok:
+        return "end"
+    if state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
+```
+
+#### Why the order
+
+Either check could come first — both lead to `"end"`. `verify_ok` first reads as the "happy path" exit; `iteration >= MAX_ITERATIONS` is the "give up" exit. The default `"revise"` is reached only when both *verify_ok is False* AND *iteration < MAX_ITERATIONS*.
+
+#### Edge-case defaults
+
+- `state.verify_ok` defaults to `False` in the dataclass — so if `verify_node` ever returns a partial dict missing this field, the router doesn't accidentally exit on True.
+- `state.iteration` starts at 0, so the comparison `>= MAX_ITERATIONS` (not `>`) is correct: after the third generate/revise call, iteration is 3 and the router exits.
+
+### 13.2 `revise_node` — mirror of generate, different prompt
+
+Closely mirrors `generate_sql_node`'s shape; the differences are which prompt constants it reads and which state fields it formats into them.
+
+```python
+def revise_node(state: AgentState) -> dict:
+    execution_text = (
+        state.execution.render() if state.execution is not None else "no execution result available"
+    )
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            execution=execution_text,
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql, "issue": state.verify_issue}],
+    }
+```
+
+#### Design notes
+
+- **`execution_text` guard against `None`.** In normal flow `state.execution` is set by `execute_node` before revise ever runs, but the 2-line guard protects against future code paths and test setups that might initialize state partially. Cheap insurance.
+- **`.format(...)` with five placeholders.** If we mismatch with `prompts.REVISE_USER`'s placeholder set, `KeyError` raises immediately at runtime — a useful tripwire.
+- **`_extract_sql(response.content)`** — reused from `generate_sql_node`. Same defensive extraction; the `_extract_sql` helper handles fences and raw output uniformly.
+- **History entry includes `"issue"`.** Unlike generate's history entry (which is just `{node, sql}`), revise's records *which* verifier complaint triggered this revision — useful in Langfuse traces when debugging "why did revise produce X?"
+
+### 13.3 `verify_node` and defensive JSON parsing
+
+The trickiest of the three. Two pieces — the node and a new helper.
+
+#### The helper: `_parse_verify_json`
+
+```python
+def _parse_verify_json(text: str) -> dict:
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    candidate = (fenced.group(1) if fenced else text).strip()
+    try:
+        result = json.loads(candidate)
+        return result if isinstance(result, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+```
+
+Mirrors `_extract_sql`'s pattern: regex out the fenced content if present, strip, try to parse, return a safe empty value on failure. Adds an `isinstance(result, dict)` check because `json.loads("42")` is valid JSON (an int) but useless to us.
+
+**`return {}` is the load-bearing safety net.** When parsing fails, the caller's `.get("ok", False)` lands on False — verify_ok defaults to False, which means *do an extra revise*. This is the safer choice than defaulting to True (which would ship answers the verifier might have rejected).
+
+#### The node itself
+
+```python
+def verify_node(state: AgentState) -> dict:
+    if state.execution is None:
+        return {
+            "verify_ok": False,
+            "verify_issue": "no execution result available",
+            "history": state.history + [
+                {"node": "verify", "verify_ok": False, "verify_issue": "no execution result"}
+            ],
+        }
+
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            execution=state.execution.render(),
+        )),
+    ])
+
+    verdict = _parse_verify_json(response.content)
+    verify_ok = bool(verdict.get("ok", False))
+    verify_issue = str(verdict.get("issue", ""))
+    if not verify_ok and not verify_issue:
+        verify_issue = "verifier rejected the result but did not provide a specific reason"
+
+    return {
+        "verify_ok": verify_ok,
+        "verify_issue": verify_issue,
+        "history": state.history + [
+            {"node": "verify", "verify_ok": verify_ok, "verify_issue": verify_issue}
+        ],
+    }
+```
+
+#### Why each design choice
+
+- **The `state.execution is None` early return.** Same defensive pattern as `revise_node`. Returns a self-describing failure (`verify_issue = "no execution result available"`) rather than crashing on `None.render()`.
+- **`bool(...)` and `str(...)` coercions on the verdict fields.** If the model produces a weird-typed `ok` (like a string `"true"`) or no `issue` at all, the coercions still yield the expected types. Falls back to safe defaults on missing keys.
+- **The empty-issue fallback.** If `verify_ok=False` and the model gave no `issue` (or we couldn't parse one), we inject a generic placeholder string. Without this, the revise prompt would say `"Why it was rejected: "` with nothing after — a confusing downstream signal.
+- **History entry shape.** Unlike generate/revise (which record `sql`), verify records its *verdict* (`verify_ok`, `verify_issue`) because that's what changed. The shape difference is intentional — each node logs the field it produced.
+- **No iteration bump.** Verify isn't a SQL-producing call; `iteration` tracks SQL attempts only. Bumping here would make `MAX_ITERATIONS` fire too early.
+
+### 13.4 Patterns to remember
+
+#### A. Mirror existing worked examples; don't reinvent
+
+`revise_node`'s shape was 95% copy-paste from `generate_sql_node`, with the prompt constants and `.format(...)` placeholders swapped. When a worked example is provided, lean on it heavily — it removes whole categories of design decisions.
+
+#### B. Defensive parsers belong next to the prompts they defend
+
+`_parse_verify_json` lives right next to `_extract_sql` in `graph.py`. Both serve the same purpose: take an LLM's raw response and produce structured output that downstream code can rely on. Keeping them adjacent makes the pattern visible: every LLM-output is parsed defensively at the node boundary, never used raw.
+
+#### C. Three layers of safety against unparseable output
+
+For the JSON path specifically:
+
+1. **The prompt** asks for fenced JSON in a specific shape. *Most* of the time the model complies.
+2. **The parser** handles fenced and unfenced, returns `{}` on any failure.
+3. **The node's `.get(key, default)` calls** mean even an empty dict produces sensible field values.
+
+Each layer catches what the previous one misses. None of them is sufficient alone, but together they make the verify path robust against the various ways LLM JSON output can go wrong.
+
+#### D. "Partial state dict" returns make the diff obvious
+
+Looking at the three node returns side by side:
+
+```python
+# generate_sql_node:  {"sql", "iteration", "history"}
+# revise_node:        {"sql", "iteration", "history"}
+# verify_node:        {"verify_ok", "verify_issue", "history"}
+```
+
+You can read off exactly what each node mutates without studying the body. The diff is the documentation. This is why partial-state returns are better than full-state returns — they self-document the node's effect on state.
+
+#### New habits this round added
+
+- **Mirror worked examples aggressively.** If the scaffolding gives you `generate_sql_node` as the template, `revise_node` should be 95% copy-paste — the design choices have already been made. Save the original thinking for the novel parts.
+- **Defensive parsers and the prompts they defend belong together in the code.** Co-locating them makes the "always parse defensively at LLM boundaries" pattern visible at a glance.
+- **Three layers of robustness > one strong layer.** For LLM output handling: prompt format contract + defensive parser + `.get(key, default)` calls in the consumer. Each layer is cheap; together they handle real-world output noise.
+- **Partial state returns are self-documenting.** A node's return dict shows exactly what it changes. Don't write nodes that return the full state — that hides the actual mutation in noise.
+
+---
+
+## 14. Phase 3 — Interactive smoke test against OpenAI (Round 4)
+
+Phase 3's contract validation: boot the agent against an OpenAI endpoint (gpt-4o-mini, off-GPU), fire 5 representative questions, verify the graph behaves as designed. **Pass criterion: at least one question triggers a revise.** Met on the second test question (and demonstrated more dramatically on a third).
+
+### 14.1 Five-question test results
+
+| # | DB | Iters | Final verify | Outcome |
+|---|---|---|---|---|
+| 1 | `superhero` — *List down Ajax's superpowers* | 1 | ok | ✅ Correct; 5 rows |
+| 2 | `formula_1` — *Coordinates for Australian GP* | 1 | ok | ✅ Correct; 1 row |
+| 3 | `california_schools` — *Top 5 schools by Enrollment (Ages 5-17)* | **2** | ok (after revise) | ⚠️ Over-corrected — verifier rejected a correct minimal answer; revise *added* unrequested columns |
+| 4 | `financial` — *Male clients in Hl.m. Praha district* | 1 | ok | ❌ 0 rows returned (`gender = 'male'` vs schema's `'M'`); verifier let it through |
+| 5 | `financial` — *Avg crimes 1995, regions > 4000, accounts opened ≥ 1997* | **3** | **MAX_ITERATIONS** | ❌ Wrong column (`A8` vs `A15`); verifier correctly kept rejecting; router cleanly exited at iter 3 |
+
+#### Q3 in detail — verifier over-correction
+
+- Q literally asks: *"Please give their NCES school identification number."*
+- Iter 1 SQL: `SELECT "NCESSchool" FROM "frpm" ORDER BY "Enrollment (Ages 5-17)" DESC LIMIT 5;` — *exactly* what was asked for.
+- Verify rejected: *"The query returned only the NCES school identification numbers without the corresponding enrollment numbers."*
+- Iter 2 (revise) added the enrollment column, deviating from the gold SQL.
+
+The verifier inferred a stronger user intent ("show me the values you sorted on") than was actually requested. Phase 5 execution-accuracy will count this as a fail vs gold.
+
+#### Q4 in detail — verifier under-correction
+
+- Iter 1 SQL ran cleanly: `WHERE "gender" = 'male' AND "district_id" = (SELECT ... WHERE "A2" = 'Hl.m. Praha')`. Returned 0 rows.
+- Verify approved.
+- The schema stores `M`/`F`, not `male`/`female`. The query "succeeded" only in the trivial sense of not erroring. Hl.m. Praha is Prague — there are obviously male clients there.
+
+The verifier didn't catch the "zero rows when rows are clearly expected" case that's #2 in the Round 1 taxonomy. The case is exactly the kind the verify prompt was designed to catch — but capable instruction-tuned models default to giving the SQL benefit of the doubt unless the *question* phrasing implies rows must exist.
+
+#### Q5 in detail — MAX_ITERATIONS exit
+
+- All three attempts returned 0 rows. Verify correctly rejected all three (this is the verifier behaving exactly right).
+- After iter 3, `route_after_verify` returned `"end"` because `state.iteration >= MAX_ITERATIONS`. Without this guard the graph would have looped forever on a bad column choice.
+
+The agent's `AnswerResponse` returned `ok=True` with the iter-3 rows (empty result) — confirming that **`AnswerResponse.ok` means "SQL executed without database error," NOT "verifier approved."** Exactly the design choice flagged in §11.3.
+
+### 14.2 Findings for Phase 6
+
+Three real, defensible findings worth recording for the Phase 6 iteration log:
+
+1. **Verifier is too strict on column selection.** Q3 rejected a minimal correct answer because it inferred user intent beyond what was written. The prompt's "wrong columns" failure mode is misfiring — it should reject results whose columns clearly *don't answer* the question, not results whose columns are merely a strict subset of what the verifier thinks would be nice to show.
+
+2. **Verifier is too lenient on zero-row results from common-data questions.** Q4 returned 0 rows for *"male clients in Prague"* and verify approved. The Round 1 taxonomy includes this case ("zero rows when rows expected") but the prompt's zero-rows caveat *("zero rows is sometimes the correct answer")* is over-applied. The model defaults to giving SQL benefit of the doubt.
+
+3. **Cryptic-column databases need extra context.** Q5 needed BIRD's "evidence" hint (which maps `A15` → "crimes in 1995") to be solvable. The current `AgentState` and prompts don't surface the hint field. This is a known limitation worth flagging in Phase 7's "what I'd do with more time."
+
+#### Tuning hypotheses for Phase 6
+
+- **For finding 1:** rebalance the verifier's third failure mode. *"Wrong columns"* should be reframed as "*returned columns can't possibly answer the question*," not "*didn't return everything I'd want to see*."
+- **For finding 2:** soften the zero-rows caveat. Currently: *"Zero rows is sometimes the correct answer ... use judgment."* Tighter version: *"Reject 0-row results unless the question explicitly suggests data may be absent."*
+- **For finding 3:** extend `AnswerRequest` and `AgentState` to carry a `hint: str | None` field, and inject it into the generate/revise prompts when present. Future scope only.
+
+These are exactly the kind of hypotheses Phase 6's "*saw X → hypothesized Y → changed Z → result W*" loop is meant to test. Run the baseline Phase 5 eval first to quantify the current verifier's pass rate, then change one verify-prompt clause at a time and measure.
+
+### 14.3 What the smoke test validated
+
+Beyond the three findings, the test gave us **confidence in the structural correctness of the agent code**:
+
+- ✅ Agent serves requests end-to-end (`/health` and `/answer` both work)
+- ✅ `generate_sql → execute → verify → router` path runs on every request
+- ✅ `verify → revise → execute → verify → router` loop fires when verify rejects (Q3, Q5)
+- ✅ `MAX_ITERATIONS` termination works (Q5 hit iter 3, router cleanly returned `"end"`)
+- ✅ JSON parsing of verify output worked across 9 verify calls (no parse failures observed)
+- ✅ `history` captures the full waterfall in the order: generate → verify → (revise → verify)* 
+- ✅ Double-quoted identifiers, identifier-with-spaces (`"Enrollment (Ages 5-17)"`), `LIMIT` for top-N — all behaved correctly
+- ✅ `AnswerResponse` schema matches: `sql`, `rows`, `iterations`, `ok`, `error`, `history`
+
+The agent is **ready** for Phase 4 (Langfuse) and Phase 5 (eval runner) — the contract works. Verifier prompt-tuning is for Phase 6 once we have eval numbers to ground it.
+
+#### Habits added this round
+
+- **Smoke-test the graph against a cheap endpoint before burning expensive GPU time on it.** OpenAI gpt-4o-mini at ~$0.01/question caught both verifier failure modes (over-strict and over-lenient) in 5 questions for under $0.05. Same testing on the H100 would have cost real GPU minutes.
+- **Read traces, not just final outputs.** The `history` field is more informative than `ok` for diagnosing agent behavior. Always check the waterfall; the final answer often hides the interesting failure.
+- **Distinguish "the code is correct" from "the prompts are good."** Round 4 validated the first; Phase 6 will tune the second. Don't conflate "agent ran end-to-end" with "agent answers correctly" — they're separate dimensions and they're tested separately.
+
+---
+
+## 15. Manual testing the agent — practical reference
+
+Shortcuts and shell snippets for poking at the running agent without copy-pasting long `curl` commands.
+
+### 15.1 The `ask()` shell helper
+
+Drop this in your shell session (or save it to `~/.zshrc` / `~/.bashrc` to make it permanent):
+
+```bash
+ask() {
+  curl -s -X POST http://localhost:8001/answer \
+    -H "Content-Type: application/json" \
+    -d "{\"question\": \"$1\", \"db\": \"$2\"}" | jq
+}
+```
+
+Then:
+
+```bash
+ask "How many superheroes are there?" superhero
+ask "Top 5 schools by enrollment" california_schools
+ask "Which constructor has won the most F1 races?" formula_1
+```
+
+**Caveat:** this version doesn't handle questions that contain a literal `"`. For casual testing it's fine; for questions with quotes inside, use the single-line `curl` form below.
+
+#### Variants worth knowing
+
+If you want only the SQL:
+
+```bash
+ask_sql() {
+  curl -s -X POST http://localhost:8001/answer \
+    -H "Content-Type: application/json" \
+    -d "{\"question\": \"$1\", \"db\": \"$2\"}" | jq -r .sql
+}
+```
+
+If you want a compact summary instead of the full response:
+
+```bash
+ask_brief() {
+  curl -s -X POST http://localhost:8001/answer \
+    -H "Content-Type: application/json" \
+    -d "{\"question\": \"$1\", \"db\": \"$2\"}" \
+    | jq '{sql, iterations, ok, rows_count: (.rows | length // 0), rows: .rows[0:3]}'
+}
+```
+
+### 15.2 Shell quoting gotchas
+
+These bit me during manual testing. Worth knowing once.
+
+| Gotcha | What goes wrong | Fix |
+|---|---|---|
+| Pasting a multi-line `curl` from a code block | Terminal soft-wraps look like newlines; shell sees multiple commands; second line treated as `command not found: -d` | Keep the `curl ... -d ... <<'EOF'` opening on a **single physical line**; use `\` continuations only between true argument boundaries |
+| Heredoc closing marker indented | Shell doesn't see `EOF` as the terminator, prompt hangs at `pipe heredoc>` | Closing `EOF` must be **flush left** (column 0, no leading whitespace). Press Ctrl-C or Ctrl-D to recover. |
+| Newline inside the JSON body of `-d '...'` | First command runs with no body, then garbage commands follow | Either put the JSON on one line, or use heredoc / variable / `ask()` helper |
+| Question contains a literal `"` | Bash word-splits at the inner quote | Escape inner quotes (`\"`) or switch to a Python one-liner / `httpie` for ad-hoc testing |
+
+**Rule of thumb:** for one-line questions, single-line `curl -d '...'` is the lowest-stress form. For longer payloads, write a heredoc with `EOF` flush left or use a `$BODY` variable.
+
+### 15.3 Useful jq filters
+
+Pipe `curl ... | jq <FILTER>` with one of these depending on what you want to see:
+
+```bash
+# Full response — verbose but complete
+| jq
+
+# Compact summary — most useful day-to-day
+| jq '{sql, iterations, ok, rows_count: (.rows | length // 0)}'
+
+# Just the SQL (great for "what did the model write")
+| jq -r .sql
+
+# The trace (generate → verify → revise waterfall)
+| jq .history
+
+# Just the rows it returned
+| jq .rows
+
+# Did it revise?  1 = first try, 2 = one revise, 3 = two revises
+| jq .iterations
+
+# Why did verify reject?  (Filters history for verify entries)
+| jq '.history[] | select(.node == "verify") | .verify_issue'
+```
+
+### 15.4 Booting and stopping the agent
+
+```bash
+# Boot agent against whatever the .env points at (OpenAI for off-GPU, vLLM on Tuesday)
+uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001 --log-level warning
+
+# Auto-reload variant — restarts on file changes to agent/*.py
+# (useful when iterating on prompts)
+uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001 --reload
+
+# Health-check the running agent
+curl http://localhost:8001/health
+
+# Kill it
+pkill -f "uvicorn agent.server"
+```
+
+Things to remember:
+- `agent/prompts.py` changes need a restart (unless using `--reload`) because the module is loaded once at boot.
+- `agent/graph.py` changes need a restart for the same reason.
+- `.env` changes need a restart — `load_dotenv()` only runs at `agent.server` import.
+
+### 15.5 Peeking at database schemas
+
+Useful when crafting questions — see the table/column structure first.
+
+```bash
+# Which tables exist
+sqlite3 data/bird/superhero.sqlite ".tables"
+
+# Full schema (CREATE TABLE statements)
+sqlite3 data/bird/superhero.sqlite ".schema"
+
+# What the agent actually sees (with double-quoted identifiers)
+uv run python -c "from agent.schema import render_schema; print(render_schema('superhero'))"
+
+# Quick peek at sample rows
+sqlite3 data/bird/superhero.sqlite "SELECT * FROM superhero LIMIT 5;"
+
+# Sanity-check a literal value (Q4-style debug: 'male' vs 'M')
+sqlite3 data/bird/financial.sqlite "SELECT DISTINCT gender FROM client;"
+sqlite3 data/bird/superhero.sqlite "SELECT DISTINCT power_name FROM superpower WHERE power_name LIKE '%light%';"
+```
+
+### 15.6 Available databases
+
+The eleven BIRD-dev databases downloaded by `scripts/load_data.py`:
+
+| `db` name | Domain |
+|---|---|
+| `california_schools` | School enrollment, test scores, demographics |
+| `card_games` | Magic: The Gathering cards, sets, rulings |
+| `codebase_community` | Stack Overflow-like Q&A site (users, posts, badges, votes) |
+| `debit_card_specializing` | Gas station transactions and customers |
+| `european_football_2` | Soccer leagues, teams, matches, players — **note: `agent/schema.py` original code crashes on this DB due to a FK-rendering bug; see this conversation's audit if you need the fix** |
+| `financial` | Czech bank — accounts, clients, loans, transactions |
+| `formula_1` | F1 races, drivers, constructors, results |
+| `student_club` | College club — events, budgets, members |
+| `superhero` | Heroes, powers, publishers, attributes |
+| `thrombosis_prediction` | Patient lab tests and diagnoses |
+| `toxicology` | Molecules, atoms, carcinogenicity labels |
+
+Pre-baked questions live in:
+
+- `evals/eval_set.jsonl` — 30 curated questions *with* gold SQL (use these to check correctness)
+- `load_test/perf_pool.jsonl` — 1500 questions for load testing, no gold SQL but more variety
