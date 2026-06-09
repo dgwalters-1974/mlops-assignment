@@ -2,6 +2,8 @@
 
 ## Workload framing
 
+** For all the following, vLLM 0.22.1 was used rather than 0.9-0.10 recommended in the docs - seemed to be an incompatibility between Qwen's tokenizer and the model.
+
 The agent makes ~3 sequential vLLM calls per user request. The platform SLO is P95 end-to-end < 5 s at 10+ RPS sustained, which decomposes into two design numbers: a **per-call latency budget of ~1.5 s** (5 s ÷ 3 calls, with a small buffer for sqlite + Python overhead) and a **concurrency target of ~50 in-flight vLLM calls**. The flags below exist to make both feasible on one 80 GB H100.
 
 The model architecture (verified against [`config.json`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507/blob/main/config.json)) sharpens these: 31 B params total / 3.3 B active per token (8-of-128 expert routing), 48 layers, GQA with 4 KV heads × head_dim 128, 256 K native context. MoE makes decode compute cheap, but all 31 B still live in VRAM (router decides per-token at inference). Per-token KV cost is exactly 96 KB at bf16 / 48 KB at fp8 — combined with the 50-concurrent target, this is what makes some flags below structurally required, not optional.
