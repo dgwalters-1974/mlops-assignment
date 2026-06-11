@@ -103,7 +103,7 @@ def eval_one(question: dict, agent_url: str) -> dict:
     payload = {
         "question": question["question"],
         "db": db_id,
-        "tags": {"experiment": "eval-baseline", "db_id": db_id},
+        "tags": {"experiment": "eval-baseline", "db_id": db_id}, # Tags are passed as metadata rather than Langfuse tags - use for filtering in Phase 6
     }
     t0 = time.monotonic()
     try:

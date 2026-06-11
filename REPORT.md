@@ -34,7 +34,49 @@ https://docs.vllm.ai/en/latest/configuration/engine_args/?h=argument (old link m
 - **Prefill starvation at `max-num-batched-tokens 2048`** — detect via Grafana showing prefill queue growth while decode steps go underused; mitigate by bumping to 4096. Tweaking balance between decoder / prefil will be clearer only during experimentation but this is as good a starting point as any.
 
 # Phase 2 — O11y Core
-Dashboard created in Grafana saved with Share->Export->Save to File and then persisted via mounted 'infra/grafana/provisioning/' within Docker and available via dashboards/dashboards.yaml and serving.json. Shows latency, throughput and KV cache. Dashboard reaction saved in `screenshots/grafana_serving.png` and dashboard at `infra/grafana/provisioning/dashboards/serving.json`.
+Dashboard created in Grafana saved with Share->Export->Save to File and then persisted via mounted 'infra/grafana/provisioning/' within Docker and available via dashboards/dashboards.yaml and serving.json. Shows latency, throughput and KV cache. 
+
+**Row 1 — concurrency and headroom.**             
+  `vllm:num_requests_running`,
+  `vllm:num_requests_waiting`,                      
+  `vllm:kv_cache_usage_perc`. Together they tell you
+  whether vLLM has slack for more load: queue depth
+  > 0 sustained = admission backpressure; KV > 90%
+  = preemptions imminent, P99 about to blow.      
+                                         
+**Row 2 — latency, where time is spent.**         
+`vllm:e2e_request_latency_seconds_bucket` and
+`vllm:time_to_first_token_seconds_bucket` rendered
+  as P50/P95/P99 via `histogram_quantile()` over a
+5m sliding window. Splitting E2E from TTFT is the
+key diagnostic — if TTFT is fine but E2E is bad,
+the slowness is in generation, not prefill or
+queueing.                         
+                                  
+**Row 3 — throughput.**                           
+`rate(vllm:generation_tokens_total[1m])` and
+`rate(vllm:prompt_tokens_total[1m])` as token     
+rates by direction, plus               
+`rate(vllm:request_success_total[1m])` for      
+completed RPS. Pair with row 2 to read effective
+sustained capacity (the SLO number is P95 latency
+at sustained RPS).                
+                                    
+**Row 4 — leverage signals.**                     
+`vllm:num_preemptions_total` (any growth = KV
+pressure is binding, expect P99 spikes), and      
+prefix cache hit rate as               
+`rate(vllm:prefix_cache_hits_total[5m]) /       
+rate(vllm:prefix_cache_queries_total[5m])`. The
+hit-rate panel is the empirical check on Phase 1's
+  prefix-caching bet — climbed to 80%+ during both
+the baseline eval and the load test, as predicted.
+
+The dashboard earned its keep in Phase 6: KV cache
+at 0% and queue depth at 0 under sustained 10 RPS
+clearly highlighted the fact that bottleneck was with the agent rather than vLLM.
+
+Dashboard reaction saved in `screenshots/grafana_serving.png` and dashboard at `infra/grafana/provisioning/dashboards/serving.json`.
 
 # Phase 3 — Agent
 "A question that triggered a productive revise".
