@@ -155,7 +155,38 @@ There were also cases where the loop worked the 'wrong' way - where the first it
 ```
 Notice the wall clock time for both these requests was in line with that we expected.
 
-# Phase 4 — Agent
+# Phase 4 — Agent o11y
+Langfuse runs locally from `docker-compose.yml` on
+port 3001 (the `LANGFUSE_INIT_ORG_ID` and        
+`LANGFUSE_INIT_PROJECT_ID` env vars are required —
+if either is missing, every other init var gets  
+silently ignored, which caught me out once). The
+agent wires it up in `agent/server.py` by       
+attaching a `CallbackHandler()` to     
+`graph.invoke(state, config={"callbacks":       
+[handler]})` —   LangGraph then emits a span per    
+node and the handler ships them to Langfuse with  
+prompts, completions, latency, and token counts   
+attached. A typical 3-iteration trace shows the
+full `generate_sql → execute ->verify ->revise ->
+execute ->verify ->revise ->execute -> verify`
+waterfall (`screenshots/langfuse_trace.png`), with
+the vLLM calls dominating wall-clock while
+`execute` and `verify` are tiny by comparison.
+Each request from the eval and load drivers is
+tagged with `{"experiment": "eval-baseline" |
+"eval-after-tuning", "db_id": "<…>"}`, passed
+through as LangChain `metadata=` rather than
+Langfuse `tags` — a small API quirk worth flagging
+since the two aren't quite interchangeable. Tags
+visible in `screenshots/langfuse_tags.png`. The
+intended Phase 6 use was to filter on
+`experiment=eval-after-tuning` and diff span-level
+latencies against baseline to localise where the
+vLLM tuning landed; in practice the 
+delta was within noise so the diff didn't reveal
+much, but the tagging is in place for any future
+tuning round.
 
 Images of langfuse output saved at: `/screenshots/langfuse_tags.png` and `/screenshots/langfuse_trace.png`
 
@@ -280,7 +311,92 @@ So with vLLM healthy (kv @ 0%, queue @ 0, no preemptions), but per-call P95 so l
   was already over-provisioned for vLLM (KV cache 0%
    under load); the gap is structural to the agent's
    sequential call graph, not the inference layer.
-                                      
+
+# Phase 6 (part 2)
+
+A couple of days after running the first batch of iterations my Nebius tenant started crashing — instances were vanishing mid-session and I lost work twice — so once I'd burned through my original window I picked up the rest of the iterations on a RunPod H100 SXM. Same workload, same Phase 1 config as the iter 1 baseline, same 10 RPS / 5 min load profile. Three quirks worth flagging up front:
+
+- RunPod pods are themselves Docker containers and don't allow Docker-in-Docker, so I couldn't bring up the Grafana / Prometheus / Langfuse stack via the project's `docker-compose.yml`. I worked from the load test JSON numbers as the evidence rather than capturing fresh dashboard screenshots. The dashboard config (`serving.json`) is unchanged so the framing from part 1 carries over conceptually.
+- vLLM had to be bumped past the 0.10 pin again (same Qwen2Tokenizer issue as session 1), and DeepGEMM had to be disabled via `VLLM_USE_DEEP_GEMM=0` because the package wouldn't build on the pod.
+- The first attempt at iter 2 below drowned in Langfuse retry queues — the agent was trying to export traces to `localhost:3001` but RunPod's nginx was holding that port and returning 405 to every export attempt. Stripping the Langfuse env vars from `.env` fixed it. Worth knowing if anyone repeats this on RunPod.
+
+With that context, here's the iteration log. Iter 1 in part 1 is the original `max-num-batched-tokens 2048 → 4096` change.
+
+### Iter 2 — `MAX_ITERATIONS 3 → 2` (agent side)
+
+- **Saw:** at iter 1, the achieved 8.33 RPS vs 10 requested showed requests piling up at the agent; about a third of questions used all 3 revise iterations, so worst-case fan-out is 9 vLLM calls per request.
+- **Hypothesised:** capping at 2 cuts worst-case fan-out by a third and should compress P95.
+- **Changed:** `MAX_ITERATIONS = 3 → 2` in `agent/graph.py`. First attempt drowned in Langfuse retry queues (see above) — redid it after stripping the env vars.
+- **Result:** wrong metric moved. P95 went 10.42 → 13.09 s (slightly worse), but achieved RPS climbed 8.33 → 9.20 and timeouts dropped 1 → 0. So the change is a throughput win, not a P95 win — P95 is bound by per-call latency under contention, not by call count. As the README puts it — "as sometimes a metric improves and the SLO doesn't, which is its own lesson."
+
+I reverted `MAX_ITERATIONS` back to 3 for iters 3-6 so each subsequent test is a clean A/B against the iter 1 baseline.
+
+### Iter 3 — `--gpu-memory-utilization 0.92 → 0.85`
+
+- **Saw:** KV cache at 0% under load — vLLM has lots of headroom on the KV pool.
+- **Hypothesised:** shrinking the pool should be a no-op since we're nowhere near filling it.
+- **Changed:** `--gpu-memory-utilization 0.92 → 0.85` in `scripts/start_vllm.sh`.
+- **Result:** hypothesis falsified. P95 dropped 10.42 → 7.09 s (-32%), P99 17.7 → 10.5 s (-40%), achieved RPS 8.33 → 9.08. Every metric improved meaningfully. But this was the first run after a fresh vLLM restart following the iter 2 disaster, so I couldn't tell whether the improvement was from the flag change or just the restart. Ran a control next.
+
+### Iter 3b — control: reverted to the iter 1 config exactly
+
+- **Saw:** iter 3's improvement was suspiciously good and confounded with a fresh restart.
+- **Hypothesised:** if the restart is what helped, running the iter 1 config (0.92, 64, 4096) on a fresh restart should produce numbers close to iter 3.
+- **Changed:** reverted `--gpu-memory-utilization 0.85 → 0.92`, fresh restart.
+- **Result:** **P95 = 7.64 s**. Confirmed — the fresh restart was doing roughly 70% of the work; the 0.85 flag was only contributing ~7% (within noise). So vLLM appears to develop latency drift across a 5-minute load test that the dashboard doesn't surface. The corrected baseline for the remaining iterations is **7.64 s**, not 10.42 s.
+
+### Iter 4 — `--max-num-seqs 64 → 32`
+
+- **Saw:** dashboard's running-batch panel peaked at 30-35 — at first glance the 64 cap looked over-provisioned.
+- **Hypothesised:** dropping the cap to 32 should be roughly neutral since we never hit the higher cap.
+- **Changed:** `--max-num-seqs 64 → 32`.
+- **Result:** strong regression. P50 1.67 → 15.4 s, P95 7.64 → 26.4 s. At our offered load (10 RPS × 3 vLLM calls each ≈ 30 concurrent steady-state) the 32 cap binds and requests queue up in vLLM's admission scheduler. The dashboard's instantaneous panel hid this — it shows the visible running count, not the pressure at the cap. So iter 1's calibration here was actually right; the dashboard's "headroom" framing was misleading on this particular flag.
+
+### Iter 5 — `--max-num-batched-tokens 4096 → 8192`
+
+- **Saw:** iter 1 already bumped this 2048 → 4096 (null). Wanted to see if more headroom helped further.
+- **Hypothesised:** doubling the per-step token budget should be flat or marginally better.
+- **Changed:** `--max-num-batched-tokens 4096 → 8192`.
+- **Result:** first run cascaded — ~50% of requests succeeded then everything fell off a cliff with a wave of timeouts and disconnects. Same shape as the Langfuse-flood crash from iter 2 but Langfuse was already disabled. Looked like a vLLM stability problem at the new memory pressure rather than a clean measurement. Re-ran to disambiguate (iter 5b).
+
+### Iter 5b — replicate of iter 5
+
+- **Saw:** iter 5 was potentially confounded — either a one-off or 8192 is genuinely unstable.
+- **Hypothesised:** if iter 5's failure was transient, the second run should be clean.
+- **Changed:** same config, fresh restart.
+- **Result:** ran clean. P95 = 6.80 s (~11% better than iter 3b, just below my ±15% noise floor), achieved RPS 9.80. So 8192 *can* be marginally better than 4096 when stable — but with 50/50 catastrophic failure across two runs, the config is sitting right at the stability boundary and isn't worth shipping. Reverted to 4096.
+
+### Iter 6 — `uvicorn --workers 4` on the agent
+
+- **Saw:** after exhausting plausible vLLM-side flags, the dashboard read still pointed at agent-side serialisation — a single uvicorn process pushing each request through 3 sequential vLLM calls.
+- **Hypothesised:** running the agent with 4 workers should parallelise across user requests and drop P95 meaningfully.
+- **Changed:** restarted agent with `uv run uvicorn agent.server:app --host 0.0.0.0 --port 8002 --workers 4`. vLLM config left at the safe iter 1 values.
+- **Result:** P95 = **6.71 s** (12% better than iter 3b, still within noise), P50 1.43 s, achieved RPS 8.45. Small real improvement but much less than I expected. So the agent's 3-call serialisation wasn't actually the dominant constraint at this load — the dominant constraint is per-call vLLM latency × 3 calls, which puts a structural floor around 6-7 s P95 regardless of how many agent workers we run.
+
+### After-tuning eval
+
+Re-ran the eval against the final config (workers=4, MAX_ITERATIONS=3, max-num-batched-tokens=4096) → `results/eval_after_tuning_v2.json`.
+
+|  | Baseline | After-tuning v2 |
+|---|---|---|
+| Overall pass rate | 30% | 30% |
+| Per-iter 1 / 2 / 3 | 30 / 27 / 30 | 30 / 27 / 30 |
+| Iteration distribution | 20 / 2 / 8 | 20 / 2 / 8 |
+| Mean wall clock | 1.02 s | 0.97 s |
+| Per-DB pass rates | (9 DBs) | bit-for-bit identical |
+
+Quality survived across all 6 iterations, which was the expected result — none of these flags or worker counts touch agent correctness, they only affect throughput and tail latency.
+
+### Verdict (part 2)
+
+**SLO still missed**, but with a cleaner read on why. Best stable P95 = **6.71 s** against the 5 s target — gap of ~34%. After 6 iterations the picture is:
+
+- vLLM was correctly calibrated in Phase 1. Three out of three flags I touched either regressed (`max-num-seqs` lower), changed within noise (`gpu-memory-utilization`), or sat at the stability ceiling (`max-num-batched-tokens` higher).
+- vLLM develops latency drift across a 5-minute load test that the dashboard doesn't show — a fresh restart clawed back ~3 s of P95. That's an operational lever for a real deployment (periodic restarts), not a one-time tuning win.
+- Agent-side workers only contributed ~12%, so the agent's serialisation isn't the dominant constraint at this load either.
+- What's left is structural: 3 sequential vLLM calls × ~2 s per-call P95 under contention ≈ a 6-7 s P95 floor. To get under 5 s you'd need to either cut per-call latency (smaller model, speculative decoding) or genuinely parallelise the agent's calls — but verify depends on generate's output so that's not possible without redesigning the loop.
+
+The honest read: the 5 s SLO probably isn't achievable with this exact architecture without compromising elsewhere.
 
 ## Phase 7 - Wrap up
 
